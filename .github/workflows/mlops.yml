@@ -34,6 +34,7 @@ jobs:
       CLOUD_BUCKET: ${{ secrets.CLOUD_BUCKET }}
     outputs:
       accuracy: ${{ steps.read_metrics.outputs.accuracy }}
+      old_accuracy: ${{ steps.read_metrics.outputs.old_accuracy }}
     steps:
       - uses: actions/checkout@v4
 
@@ -58,16 +59,28 @@ jobs:
       - name: Pull data with DVC
         run: dvc pull
 
+      - name: Download previous metrics (Bonus 4)
+        run: |
+          mkdir -p outputs
+          aws s3 cp s3://${CLOUD_BUCKET}/models/latest/metrics.json outputs/old_metrics.json || echo "No previous metrics found"
+
       - name: Train model
         run: python src/train.py
 
-      - name: Read metrics
+      - name: Read metrics and compare
         id: read_metrics
         run: |
           ACC=$(python -c "import json; print(json.load(open('outputs/metrics.json'))['accuracy'])")
           echo "accuracy=$ACC" >> $GITHUB_OUTPUT
+          
+          if [ -f outputs/old_metrics.json ]; then
+            OLD_ACC=$(python -c "import json; print(json.load(open('outputs/old_metrics.json'))['accuracy'])")
+          else
+            OLD_ACC=0.0
+          fi
+          echo "old_accuracy=$OLD_ACC" >> $GITHUB_OUTPUT
 
-      - name: Upload model to Cloud Storage
+      - name: Upload model and metrics to Cloud Storage
         run: |
           python - <<'EOF'
           import boto3
@@ -76,14 +89,17 @@ jobs:
           s3_client = boto3.client('s3')
           bucket = os.environ["CLOUD_BUCKET"]
           s3_client.upload_file("models/model.pkl", bucket, "models/latest/model.pkl")
-          print(f"Uploaded models/model.pkl to s3://{bucket}/models/latest/model.pkl")
+          s3_client.upload_file("outputs/metrics.json", bucket, "models/latest/metrics.json")
+          print(f"Uploaded models/model.pkl and metrics.json to s3://{bucket}/models/latest/")
           EOF
 
-      - name: Save metrics as artifact
+      - name: Save metrics and report as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: metrics
-          path: outputs/metrics.json
+          name: metrics-and-report
+          path: |
+            outputs/metrics.json
+            outputs/report.txt
 
   eval:
     name: Eval
@@ -94,9 +110,15 @@ jobs:
         run: |
           python - <<'EOF'
           acc = float("${{ needs.train.outputs.accuracy }}")
+          old_acc = float("${{ needs.train.outputs.old_accuracy }}")
+          
           if acc < 0.70:
               raise SystemExit(f"FAILED: accuracy {acc:.4f} < 0.70. Huy deploy.")
-          print(f"PASSED: accuracy {acc:.4f} >= 0.70. Dang trien khai model.")
+              
+          if acc < old_acc:
+              raise SystemExit(f"FAILED: accuracy {acc:.4f} thap hon model hien tai ({old_acc:.4f}). Huy deploy do Rollback Logic (Bonus 4).")
+              
+          print(f"PASSED: accuracy {acc:.4f} >= 0.70 va cao hon/bang model cu ({old_acc:.4f}). Dang trien khai model.")
           EOF
 
   deploy:
